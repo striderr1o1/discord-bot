@@ -3,6 +3,7 @@ import asyncio
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
+from aiohttp import web
 
 from services import db, llm, scheduler
 from cogs.tasks import TasksCog
@@ -122,10 +123,26 @@ async def on_message(message: discord.Message):
     await bot.process_commands(message)
 
 
+async def run_web_server():
+    async def handle(request):
+        return web.Response(text="OK")
+    app = web.Application()
+    app.router.add_get("/", handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"[Web] Listening on port {port}")
+
+
 async def main():
     token = os.environ["DISCORD_BOT_TOKEN"]
     try:
-        await bot.start(token)
+        await asyncio.gather(
+            bot.start(token),
+            run_web_server(),
+        )
     finally:
         scheduler.stop_scheduler()
         await db.disconnect()
