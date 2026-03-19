@@ -5,28 +5,52 @@ A personal Discord bot that accepts natural language messages to create tasks, s
 
 ## Tech Stack
 - **Python 3.11+**
-- **discord.py** — Discord bot framework
-- **Groq API** — LLM for natural language parsing (extract tasks, times, intents)
-- **MongoDB Atlas** — persistent storage (via `motor` async driver)
-- **APScheduler** — in-process scheduler for firing reminders
+- **discord.py 2.3.2** — Discord bot framework
+- **Groq API (groq 0.11.0)** — LLM (`llama-3.3-70b-versatile`) for natural language parsing
+- **MongoDB Atlas** — persistent storage via `motor 3.5.1` async driver
+- **APScheduler 3.10.4** — in-process scheduler for reminders and routines
+- **httpx 0.27.2** — pinned to this version (newer versions break groq due to `proxies` kwarg removal)
+
+## Conda Environment
+```bash
+conda create -n discord-bot python=3.11
+conda activate discord-bot
+pip install -r requirements.txt
+```
+
+## Running
+```bash
+conda activate discord-bot
+python bot.py
+```
 
 ## Project Structure
 ```
 discord-bot/
 ├── CLAUDE.md
-├── .env                  # BOT_TOKEN, GROQ_API_KEY, MONGO_URI
+├── .env                  # secrets — never commit
+├── .env.example          # template
+├── .gitignore
 ├── requirements.txt
-├── bot.py                # entry point — bot setup, event loop
+├── bot.py                # entry point — message router, event loop
 ├── cogs/
-│   ├── tasks.py          # task CRUD (add/list/complete/delete)
-│   ├── reminders.py      # reminder scheduling & firing
-│   └── routine.py        # routine management
+│   ├── tasks.py          # add/list/complete/delete tasks + reminder firing
+│   └── routine.py        # recurring routine CRUD + cron firing
 ├── services/
-│   ├── llm.py            # Groq API calls — parse natural language → structured data
-│   ├── db.py             # MongoDB connection & helpers
-│   └── scheduler.py      # APScheduler setup, add/remove jobs
+│   ├── llm.py            # Groq API — natural language → structured JSON
+│   ├── db.py             # MongoDB CRUD (tasks, routines, settings)
+│   └── scheduler.py      # APScheduler setup, one-time & cron jobs
 └── models/
-    └── schemas.py        # data shapes (Task, Reminder, Routine)
+    └── schemas.py        # Task and Routine dataclasses
+```
+
+## Environment Variables (.env)
+```
+DISCORD_BOT_TOKEN=
+DISCORD_USER_ID=        # your personal Discord user ID (right-click self → Copy ID)
+GROQ_API_KEY=
+MONGO_URI=              # mongodb+srv://user:pass@cluster.mongodb.net/discord_bot
+TIMEZONE=Asia/Karachi   # default timezone if not set via bot command
 ```
 
 ## Data Models (MongoDB)
@@ -38,8 +62,8 @@ discord-bot/
   "title": "string",
   "description": "string | null",
   "due_at": "datetime | null",
-  "reminders": ["datetime"],       // list of times to send reminder DMs
-  "recurrence": "string | null",   // e.g. "daily", "weekly:mon,wed,fri"
+  "reminders": ["datetime"],
+  "recurrence": "string | null",
   "status": "pending | done",
   "created_at": "datetime"
 }
@@ -49,65 +73,85 @@ discord-bot/
 ```json
 {
   "_id": "ObjectId",
-  "name": "string",                // e.g. "Morning Routine"
-  "time": "string",                // e.g. "07:00"
+  "name": "string",
+  "time": "HH:MM",
   "days": ["mon","tue","wed","thu","fri","sat","sun"],
-  "items": ["string"],             // ordered list of things to do
+  "items": ["string"],
   "enabled": true,
   "created_at": "datetime"
 }
 ```
 
-## How It Works
-
-### 1. Message Flow
-- User sends a DM (or message in a designated channel) to the bot
-- Bot sends the raw message to **Groq LLM** with a system prompt that extracts:
-  - `intent`: one of `add_task`, `list_tasks`, `complete_task`, `delete_task`, `set_routine`, `list_routines`, `delete_routine`, `unknown`
-  - `task_title`, `description`, `due_at`, `reminders[]`, `recurrence` (for task intents)
-  - `routine_name`, `time`, `days`, `items` (for routine intents)
-- Bot acts on the parsed intent, confirms back to user
-
-### 2. Natural Language Examples
-```
-"remind me to submit the report by friday 5pm"
-→ { intent: "add_task", title: "submit the report", due_at: "2026-03-20T17:00", reminders: ["2026-03-20T16:30"] }
-
-"every weekday at 7am remind me: stretch, journal, review calendar"
-→ { intent: "set_routine", name: "Morning Routine", time: "07:00", days: ["mon"-"fri"], items: [...] }
-
-"what's on my plate?"
-→ { intent: "list_tasks" }
-
-"done with grocery shopping"
-→ { intent: "complete_task", title: "grocery shopping" }
+### settings collection
+```json
+{ "key": "timezone", "value": "Asia/Karachi" }
 ```
 
-### 3. Reminder System
-- When a task is created with reminder times, **APScheduler** jobs are scheduled
-- When a routine is created/enabled, APScheduler cron jobs are scheduled
-- On bot startup, all pending reminders and active routines are loaded from MongoDB and re-scheduled
-- When a job fires, bot sends a Discord DM to the user
+## Intents (LLM Output)
 
-### 4. Routine System
-- Routines are recurring schedules (e.g. "every weekday at 7am: stretch, journal, plan day")
-- Stored in MongoDB, managed via natural language or explicit commands
-- Each active routine becomes an APScheduler cron job
-- Reminder DM lists the routine items in order
+| Intent | Trigger |
+|---|---|
+| `add_task` | single task/reminder |
+| `add_multiple_tasks` | list of tasks for a specific day |
+| `list_tasks` | view pending tasks |
+| `complete_task` | mark task done |
+| `delete_task` | remove a task |
+| `set_routine` | create a **recurring** routine (repeats weekly) |
+| `list_routines` | view all routines |
+| `delete_routine` | remove a routine |
+| `set_timezone` | change timezone |
+| `unknown` | fallback |
 
-## Implementation Order
-1. **Scaffold** — project setup, .env, requirements.txt, bot.py skeleton
-2. **Database** — MongoDB connection via motor, basic CRUD in `services/db.py`
-3. **LLM parsing** — Groq integration in `services/llm.py`, system prompt, structured output
-4. **Task cog** — handle add/list/complete/delete tasks via parsed intents
-5. **Scheduler** — APScheduler setup, schedule reminders on task creation, reload on startup
-6. **Reminder cog** — fire DMs when reminders trigger
-7. **Routine cog** — routine CRUD + cron-based scheduling
-8. **Polish** — error handling, timezone support, edge cases
+## Reminder Logic
+- `"at X"` → reminder fires **at** X (same as due time)
+- `"by X"` → reminder fires **30 min before** X
+- Explicit reminder time always wins
+- AM/PM ambiguous → pick whichever is sooner in the future from now
+- `set_routine` is for **recurring** schedules only — if user says "tomorrow", it becomes `add_multiple_tasks`
+
+## Known Fixes Applied
+- **httpx pinned to 0.27.2** — groq 0.11.0 passes `proxies` to httpx which was removed in newer versions
+- **System prompt uses `.replace()` not `.format()`** — prompt contains JSON with `{}` which broke Python's str.format
+- **LLM logs added** — every message prints `[LLM] User:`, `[LLM] Raw response:`, `[LLM] Parsed intent:` to terminal
+- **Error handler in `on_message`** — wraps entire handler in try/except, sends error to Discord DM so failures are visible
+
+## Usage Examples
+
+**Single task:**
+```
+remind me to submit assignment by friday 11pm
+call doctor tomorrow at 2pm
+buy groceries
+```
+
+**Day schedule (multiple tasks):**
+```
+tomorrow: 8am entrepreneurship class, 10am DBMS lab, 5pm study time, 7pm study
+```
+
+**Mark done / delete:**
+```
+done with groceries
+delete dentist task
+```
+
+**Recurring routine:**
+```
+every weekday at 7am: drink water, stretch, check calendar
+every sunday at 9pm: plan the week, review goals
+```
+
+**Manage:**
+```
+what's on my plate?
+show my routines
+delete morning routine
+set timezone Asia/Karachi
+```
 
 ## Key Decisions
-- **DM-based**: bot works in DMs so you can message it from phone like texting
-- **Single user**: no auth complexity, bot owner = the user
-- **LLM-first**: no slash commands needed — just type naturally. The LLM figures out intent.
-- **APScheduler**: runs in the same process as the bot, no need for external cron/celery
-- **Timezone**: user sets their timezone once (stored in DB), all times interpreted in that TZ
+- **DM-only**: bot ignores server messages, only responds in DMs
+- **Single user**: only responds to `DISCORD_USER_ID`, no multi-user auth
+- **LLM-first**: no slash commands — type naturally
+- **APScheduler in-process**: no external cron/celery needed
+- **Startup reload**: on every restart, pending reminders and enabled routines are reloaded from MongoDB and rescheduled
